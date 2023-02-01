@@ -19,11 +19,13 @@ rust_library {
     defaults: ["librustutils_defaults"],
     shared_libs: [
         "libbase",
+        "libcutils",
     ],
     apex_available: [
         "//apex_available:platform",
-        "com.android.bluetooth",
+        "com.android.btservices",
         "com.android.compos",
+        "com.android.uwb",
         "com.android.virt",
     ],
     vendor_available: true,
@@ -55,8 +57,9 @@ rust_bindgen {
     vendor_available: true,
     apex_available: [
         "//apex_available:platform",
-        "com.android.bluetooth",
+        "com.android.btservices",
         "com.android.compos",
+        "com.android.uwb",
         "com.android.virt",
     ],
     min_sdk_version: "29",
@@ -69,6 +72,7 @@ rust_bindgen {
     source_stem: "bindings",
     header_libs: ["libcutils_headers"],
     bindgen_flags: [
+        "--allowlist-function", "android_get_control_socket",
         "--allowlist-var", "AID_KEYSTORE",
         "--allowlist-var", "AID_ROOT",
         "--allowlist-var", "AID_SHELL",
@@ -78,8 +82,9 @@ rust_bindgen {
     vendor_available: true,
     apex_available: [
         "//apex_available:platform",
-        "com.android.bluetooth",
+        "com.android.btservices",
         "com.android.compos",
+        "com.android.uwb",
         "com.android.virt",
     ],
     min_sdk_version: "29",
