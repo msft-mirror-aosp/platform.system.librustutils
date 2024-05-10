@@ -15,50 +15,21 @@
 //! This crate provides the PropertyWatcher type, which watches for changes
 //! in Android system properties.
 
+// Temporary public re-export to avoid breaking dependents.
+pub use self::error::{PropertyWatcherError, Result};
 use anyhow::Context;
+use libc::timespec;
 use std::os::raw::c_char;
 use std::ptr::null;
 use std::{
     ffi::{c_uint, c_void, CStr, CString},
-    str::Utf8Error,
+    time::{Duration, Instant},
 };
 use system_properties_bindgen::prop_info as PropInfo;
-use thiserror::Error;
 
-/// Errors this crate can generate
-#[derive(Error, Debug)]
-pub enum PropertyWatcherError {
-    /// We can't watch for a property whose name contains a NUL character.
-    #[error("Cannot convert name to C string")]
-    BadNameError(#[from] std::ffi::NulError),
-    /// We can only watch for properties that exist when the watcher is created.
-    #[error("System property is absent")]
-    SystemPropertyAbsent,
-    /// System properties are not initialized
-    #[error("System properties are not initialized.")]
-    Uninitialized,
-    /// __system_property_wait timed out despite being given no timeout.
-    #[error("Wait failed")]
-    WaitFailed,
-    /// read callback was not called
-    #[error("__system_property_read_callback did not call callback")]
-    ReadCallbackNotCalled,
-    /// read callback gave us a NULL pointer
-    #[error("__system_property_read_callback gave us a NULL pointer instead of a string")]
-    MissingCString,
-    /// read callback gave us a bad C string
-    #[error("__system_property_read_callback gave us a non-UTF8 C string")]
-    BadCString(#[from] Utf8Error),
-    /// read callback returned an error
-    #[error("Callback failed")]
-    CallbackError(#[from] anyhow::Error),
-    /// Failure in setting the system property
-    #[error("__system_property_set failed.")]
-    SetPropertyFailed,
-}
-
-/// Result type specific for this crate.
-pub type Result<T> = std::result::Result<T, PropertyWatcherError>;
+pub mod error;
+#[doc(hidden)]
+pub mod parsers_formatters;
 
 /// PropertyWatcher takes the name of an Android system property such
 /// as `keystore.boot_level`; it can report the current value of this
@@ -72,18 +43,14 @@ pub struct PropertyWatcher {
 impl PropertyWatcher {
     /// Create a PropertyWatcher for the named system property.
     pub fn new(name: &str) -> Result<Self> {
-        Ok(Self {
-            prop_name: CString::new(name)?,
-            prop_info: null(),
-            serial: 0,
-        })
+        Ok(Self { prop_name: CString::new(name)?, prop_info: null(), serial: 0 })
     }
 
     // Lazy-initializing accessor for self.prop_info.
     fn get_prop_info(&mut self) -> Option<*const PropInfo> {
         if self.prop_info.is_null() {
-            // Unsafe required for FFI call. Input and output are both const.
-            // The returned pointer is valid for the lifetime of the program.
+            // SAFETY: Input and output are both const. The returned pointer is valid for the
+            // lifetime of the program.
             self.prop_info = unsafe {
                 system_properties_bindgen::__system_property_find(self.prop_name.as_ptr())
             };
@@ -108,21 +75,26 @@ impl PropertyWatcher {
             let name = if name.is_null() {
                 None
             } else {
-                Some(CStr::from_ptr(name))
+                // SAFETY: system property names are null-terminated C strings in UTF-8. See
+                // IsLegalPropertyName in system/core/init/util.cpp.
+                Some(unsafe { CStr::from_ptr(name) })
             };
             let value = if value.is_null() {
                 None
             } else {
-                Some(CStr::from_ptr(value))
+                // SAFETY: system property values are null-terminated C strings in UTF-8. See
+                // IsLegalPropertyValue in system/core/init/util.cpp.
+                Some(unsafe { CStr::from_ptr(value) })
             };
-            let f = &mut *res_p.cast::<&mut dyn FnMut(Option<&CStr>, Option<&CStr>)>();
+            // SAFETY: We converted the FnMut from `f` to a void pointer below, now we convert it
+            // back.
+            let f = unsafe { &mut *res_p.cast::<&mut dyn FnMut(Option<&CStr>, Option<&CStr>)>() };
             f(name, value);
         }
 
         let mut f: &mut dyn FnMut(Option<&CStr>, Option<&CStr>) = &mut f;
 
-        // Unsafe block for FFI call. We convert the FnMut
-        // to a void pointer, and unwrap it in our callback.
+        // SAFETY: We convert the FnMut to a void pointer, and unwrap it in our callback.
         unsafe {
             system_properties_bindgen::__system_property_read_callback(
                 prop_info,
@@ -140,17 +112,13 @@ impl PropertyWatcher {
     where
         F: FnMut(&str, &str) -> anyhow::Result<T>,
     {
-        let prop_info = self
-            .get_prop_info()
-            .ok_or(PropertyWatcherError::SystemPropertyAbsent)?;
+        let prop_info = self.get_prop_info().ok_or(PropertyWatcherError::SystemPropertyAbsent)?;
         let mut result = Err(PropertyWatcherError::ReadCallbackNotCalled);
         Self::read_raw(prop_info, |name, value| {
             // use a wrapping closure as an erzatz try block.
             result = (|| {
                 let name = name.ok_or(PropertyWatcherError::MissingCString)?.to_str()?;
-                let value = value
-                    .ok_or(PropertyWatcherError::MissingCString)?
-                    .to_str()?;
+                let value = value.ok_or(PropertyWatcherError::MissingCString)?.to_str()?;
                 f(name, value).map_err(PropertyWatcherError::CallbackError)
             })()
         });
@@ -159,14 +127,14 @@ impl PropertyWatcher {
 
     // Waits for the property that self is watching to be created. Returns immediately if the
     // property already exists.
-    fn wait_for_property_creation(&mut self) -> Result<()> {
+    fn wait_for_property_creation_until(&mut self, until: Option<Instant>) -> Result<()> {
         let mut global_serial = 0;
         loop {
             match self.get_prop_info() {
                 Some(_) => return Ok(()),
                 None => {
-                    // Unsafe call for FFI. The function modifies only global_serial, and has
-                    // no side-effects.
+                    let remaining_timeout = remaining_time_until(until);
+                    // SAFETY: The function modifies only global_serial, and has no side-effects.
                     if !unsafe {
                         // Wait for a global serial number change, then try again. On success,
                         // the function will update global_serial with the last version seen.
@@ -174,7 +142,11 @@ impl PropertyWatcher {
                             null(),
                             global_serial,
                             &mut global_serial,
-                            null(),
+                            if let Some(remaining_timeout) = &remaining_timeout {
+                                remaining_timeout
+                            } else {
+                                null()
+                            },
                         )
                     } {
                         return Err(PropertyWatcherError::WaitFailed);
@@ -184,31 +156,60 @@ impl PropertyWatcher {
         }
     }
 
-    /// Wait for the system property to change. This
-    /// records the serial number of the last change, so
-    /// race conditions are avoided.
-    pub fn wait(&mut self) -> Result<()> {
+    /// Waits until the system property changes, or `until` is reached.
+    ///
+    /// This records the serial number of the last change, so race conditions are avoided.
+    fn wait_for_property_change_until(&mut self, until: Option<Instant>) -> Result<()> {
         // If the property is null, then wait for it to be created. Subsequent waits will
         // skip this step and wait for our specific property to change.
         if self.prop_info.is_null() {
-            return self.wait_for_property_creation();
+            return self.wait_for_property_creation_until(None);
         }
 
+        let remaining_timeout = remaining_time_until(until);
         let mut new_serial = self.serial;
-        // Unsafe block to call __system_property_wait.
-        // All arguments are private to PropertyWatcher so we
-        // can be confident they are valid.
+        // SAFETY: All arguments are private to PropertyWatcher so we can be confident they are
+        // valid.
         if !unsafe {
             system_properties_bindgen::__system_property_wait(
                 self.prop_info,
                 self.serial,
                 &mut new_serial,
-                null(),
+                if let Some(remaining_timeout) = &remaining_timeout {
+                    remaining_timeout
+                } else {
+                    null()
+                },
             )
         } {
             return Err(PropertyWatcherError::WaitFailed);
         }
         self.serial = new_serial;
+        Ok(())
+    }
+
+    /// Waits for the system property to change, or the timeout to elapse.
+    ///
+    /// This records the serial number of the last change, so race conditions are avoided.
+    pub fn wait(&mut self, timeout: Option<Duration>) -> Result<()> {
+        let until = timeout.map(|timeout| Instant::now() + timeout);
+        self.wait_for_property_change_until(until)
+    }
+
+    /// Waits until the property exists and has the given value.
+    pub fn wait_for_value(
+        &mut self,
+        expected_value: &str,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
+        let until = timeout.map(|timeout| Instant::now() + timeout);
+
+        self.wait_for_property_creation_until(until)?;
+
+        while self.read(|_, value| Ok(value != expected_value))? {
+            self.wait_for_property_change_until(until)?;
+        }
+
         Ok(())
     }
 }
@@ -225,37 +226,45 @@ pub fn read(name: &str) -> Result<Option<String>> {
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
-    if ["1", "y", "yes", "on", "true"].contains(&value) {
-        Some(true)
-    } else if ["0", "n", "no", "off", "false"].contains(&value) {
-        Some(false)
-    } else {
-        None
+    match value {
+        "1" | "y" | "yes" | "on" | "true" => Some(true),
+        "0" | "n" | "no" | "off" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Returns the duration remaining until the given instant.
+///
+/// Returns `None` if `None` is passed in, or `Some(0)` if `until` is in the past.
+fn remaining_time_until(until: Option<Instant>) -> Option<timespec> {
+    until.map(|until| {
+        duration_to_timespec(until.checked_duration_since(Instant::now()).unwrap_or_default())
+    })
+}
+
+/// Converts the given `Duration` to a C `timespec`.
+fn duration_to_timespec(duration: Duration) -> timespec {
+    timespec {
+        tv_sec: duration.as_secs().try_into().unwrap(),
+        tv_nsec: duration.subsec_nanos() as _,
     }
 }
 
 /// Returns true if the system property `name` has the value "1", "y", "yes", "on", or "true",
 /// false for "0", "n", "no", "off", or "false", or `default_value` otherwise.
 pub fn read_bool(name: &str, default_value: bool) -> Result<bool> {
-    Ok(read(name)?
-        .as_deref()
-        .and_then(parse_bool)
-        .unwrap_or(default_value))
+    Ok(read(name)?.as_deref().and_then(parse_bool).unwrap_or(default_value))
 }
 
 /// Writes a system property.
 pub fn write(name: &str, value: &str) -> Result<()> {
     if
-    // Unsafe required for FFI call. Input and output are both const and valid strings.
+    // SAFETY: Input and output are both const and valid strings.
     unsafe {
         // If successful, __system_property_set returns 0, otherwise, returns -1.
         system_properties_bindgen::__system_property_set(
-            CString::new(name)
-                .context("Failed to construct CString from name.")?
-                .as_ptr(),
-            CString::new(value)
-                .context("Failed to construct CString from value.")?
-                .as_ptr(),
+            CString::new(name).context("Failed to construct CString from name.")?.as_ptr(),
+            CString::new(value).context("Failed to construct CString from value.")?.as_ptr(),
         )
     } == 0
     {
@@ -276,9 +285,11 @@ where
         value: *const c_char,
         _: c_uint,
     ) {
-        // SAFETY: system properties are null-terminated C string in UTF-8. See IsLegalPropertyName
-        // and IsLegalPropertyValue in system/core/init/util.cpp.
+        // SAFETY: system property names are null-terminated C strings in UTF-8. See
+        // IsLegalPropertyName in system/core/init/util.cpp.
         let name = unsafe { CStr::from_ptr(name) }.to_str().unwrap();
+        // SAFETY: system property values are null-terminated C strings in UTF-8. See
+        // IsLegalPropertyValue in system/core/init/util.cpp.
         let value = unsafe { CStr::from_ptr(value) }.to_str().unwrap();
 
         let ptr = res_p as *mut F;
